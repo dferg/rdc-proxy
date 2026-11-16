@@ -235,3 +235,54 @@ async def test_local_mode_ends_when_rdc_goes_silent(reset_handshake):
         )
     finally:
         CFG.pop("rdc_idle_timeout_s", None)
+
+
+@pytest.mark.parametrize("ip,expected", [
+    ("127.0.0.1", True),
+    ("0.0.0.0", True),
+    ("10.99.0.1", True),
+    ("192.168.6.20", True),
+    ("172.16.4.4", True),
+    ("169.254.1.1", True),
+    ("::1", True),
+    ("", True),
+    ("8.8.8.8", False),
+    ("20.42.6.10", False),
+])
+def test_is_private_or_local(ip, expected):
+    assert proxy_mod.is_private_or_local(ip) is expected
+
+
+@pytest.mark.asyncio
+async def test_redirected_connection_resolves_cloud_instead_of_dialing_itself(monkeypatch):
+    """A connection that arrived via DNAT/REDIRECT has a private local
+    address. The proxy must look the cloud up, not relay to that address."""
+    import time
+
+    class RedirectedWriter(FakeWriter):
+        class _Sock:
+            def getsockname(self):
+                return ("10.99.0.1", 5253)
+
+            def setsockopt(self, *_a):
+                return
+
+        def get_extra_info(self, name, *_a, **_kw):
+            return self._Sock() if name == "socket" else None
+
+    calls = []
+
+    async def fake_proxy_mode(_r, _w, cloud_ip, cloud_port=None):
+        calls.append((cloud_ip, cloud_port))
+
+    monkeypatch.setattr(proxy_mod, "proxy_mode", fake_proxy_mode)
+    monkeypatch.setattr(proxy_mod, "check_cloud_reachable", lambda: "20.42.6.10")
+    state_mod.STATE.internet_up = True
+    state_mod.STATE.internet_stable_since = time.time() - 10_000
+    try:
+        await proxy_mod.handle_rdc_connection(FakeReader(), RedirectedWriter())
+    finally:
+        state_mod.STATE.internet_up = False
+        state_mod.STATE.internet_stable_since = None
+
+    assert calls == [("20.42.6.10", None)]

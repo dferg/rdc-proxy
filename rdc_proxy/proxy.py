@@ -7,6 +7,7 @@ Three modes (decided per RDC connection):
 """
 
 import asyncio
+import ipaddress
 import socket
 import struct
 import time
@@ -170,19 +171,28 @@ async def forward_and_tap(src_reader, dst_writer, tap_fn, label="", idle_timeout
 
 # ── Connection lifecycle / mode dispatch ───────────────────────────────────
 
-def _local_ips():
-    """Best-effort set of this host's own IPs (for detecting non-TPROXY connects)."""
-    ips = {"0.0.0.0", "127.0.0.1", "::1"}
+def is_private_or_local(ip):
+    """True when ip cannot be the real cloud: loopback, unspecified,
+    link-local or private (RFC 1918) space.
+
+    With TPROXY the accepted socket's local address is the cloud address the
+    RDC dialed, and we relay to exactly that. When the RDC reaches us some
+    other way — DNS override, DNAT/REDIRECT, a port-forward — the local address
+    is one of our own, and relaying to it would connect the proxy to itself.
+    """
+    if not ip:
+        return True
     try:
-        import socket as _s
-        for info in _s.getaddrinfo(_s.gethostname(), None):
-            ips.add(info[4][0])
-    except Exception:
-        pass
-    return ips
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified
 
 
-_LOCAL_IPS = _local_ips()
+async def _find_cloud():
+    """check_cloud_reachable() does blocking DNS + connects; keep it off the
+    event loop so telemetry keeps flowing while it runs."""
+    return await asyncio.get_running_loop().run_in_executor(None, check_cloud_reachable)
 
 
 async def handle_rdc_connection(rdc_reader, rdc_writer):
@@ -193,8 +203,8 @@ async def handle_rdc_connection(rdc_reader, rdc_writer):
     if sock:
         try:
             orig_dst = sock.getsockname()
-            if orig_dst[0] in _LOCAL_IPS:
-                orig_dst = None  # non-TPROXY connect to us directly
+            if is_private_or_local(orig_dst[0]):
+                orig_dst = None  # not TPROXY — we resolve the cloud ourselves
         except Exception:
             pass
 
@@ -215,7 +225,7 @@ async def handle_rdc_connection(rdc_reader, rdc_writer):
         )
 
         if internet_stable:
-            cloud_ip = orig_dst[0] if orig_dst else check_cloud_reachable()
+            cloud_ip = orig_dst[0] if orig_dst else await _find_cloud()
             cloud_port = orig_dst[1] if orig_dst else None
             if cloud_ip:
                 await proxy_mode(rdc_reader, rdc_writer, cloud_ip, cloud_port)
@@ -228,7 +238,7 @@ async def handle_rdc_connection(rdc_reader, rdc_writer):
             print("[proxy] no handshake + no stable internet — WAITING mode", flush=True)
             while not STATE.internet_up:
                 await asyncio.sleep(5)
-            cloud_ip = check_cloud_reachable()
+            cloud_ip = await _find_cloud()
             if cloud_ip:
                 await proxy_mode(rdc_reader, rdc_writer, cloud_ip)
             else:
@@ -366,7 +376,7 @@ async def local_mode(rdc_reader, rdc_writer):
                 and STATE.internet_stable_since
                 and (time.time() - STATE.internet_stable_since) >= stable_threshold
             ):
-                cloud_ip = check_cloud_reachable()
+                cloud_ip = await _find_cloud()
                 if cloud_ip:
                     print("[proxy] internet stable + cloud reachable — terminating local session for proxy switchover", flush=True)
                     break
