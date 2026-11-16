@@ -175,3 +175,63 @@ async def test_handle_rdc_connection_closes_rdc_side_when_session_ends(reset_han
 
     assert rdc_writer.closed is True
     assert state_mod.STATE.rdc_connected is False
+
+
+def test_configure_keepalive_enables_keepalive_on_real_socket():
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        proxy_mod.configure_keepalive(s, user_timeout_s=60)
+        assert s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
+    finally:
+        s.close()
+
+
+def test_configure_keepalive_tolerates_missing_or_fake_socket():
+    proxy_mod.configure_keepalive(None)
+    proxy_mod.configure_keepalive(object())  # no setsockopt — must not raise
+
+
+class SilentReader:
+    """A peer that is connected but never sends anything."""
+
+    async def read(self, _n):
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_forward_and_tap_stops_when_source_goes_silent():
+    dst = FakeWriter()
+    await asyncio.wait_for(
+        proxy_mod.forward_and_tap(SilentReader(), dst, None, label="t", idle_timeout=0.05),
+        timeout=5,
+    )
+    assert bytes(dst.buf) == b""
+
+
+@pytest.mark.asyncio
+async def test_local_mode_ends_when_rdc_goes_silent(reset_handshake):
+    """After the handshake, an RDC that stops sending must not hold the
+    session open forever."""
+    from rdc_proxy.config import CFG
+
+    HANDSHAKE["cloud_greeting"] = b"G" * 576
+    HANDSHAKE["rdc_response"] = b"R" * 576
+    HANDSHAKE["config_msg"] = b"C" * 36
+    state_mod.STATE.internet_up = False
+
+    class HandshakeThenSilence(FakeReader):
+        async def read(self, n):
+            if self.pos >= len(self.data):
+                await asyncio.sleep(3600)
+            return await super().read(n)
+
+    CFG["rdc_idle_timeout_s"] = 0.05
+    try:
+        await asyncio.wait_for(
+            proxy_mod.local_mode(HandshakeThenSilence(b"R" * 576), FakeWriter()),
+            timeout=5,
+        )
+    finally:
+        CFG.pop("rdc_idle_timeout_s", None)

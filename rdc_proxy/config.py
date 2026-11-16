@@ -83,6 +83,15 @@ DEFAULT_CONFIG = {
     # End the RDC's session with a TCP RST rather than a FIN. The RDC does not
     # reliably reconnect after a graceful close.
     "rdc_reset_on_close": True,
+    # Dead-session detection. TCP keepalive on both legs notices a peer that
+    # went away without closing; cloud_tcp_user_timeout_s bounds how long data
+    # sent to the cloud may go unacknowledged (Linux only); rdc_idle_timeout_s
+    # ends a session when the RDC has sent nothing for that long (0 disables).
+    "tcp_keepalive_idle_s": 30,
+    "tcp_keepalive_interval_s": 10,
+    "tcp_keepalive_count": 3,
+    "cloud_tcp_user_timeout_s": 60,
+    "rdc_idle_timeout_s": 120,
     "oil_check_runtime_hours": 24,
     "stale_seconds": 45,
     "stale_thresholds": STALE_THRESHOLDS_DEFAULTS,

@@ -98,6 +98,41 @@ def abort_connection(writer):
         pass
 
 
+def configure_keepalive(sock, user_timeout_s=None):
+    """Turn on TCP keepalive so a silently dead peer is noticed in about a
+    minute instead of never.
+
+    Without this, a path that goes dark without closing the connection (a
+    router reboot that forgets its NAT state, a pulled cable) leaves the
+    session open forever: nothing is sent, so nothing fails.
+
+    user_timeout_s additionally bounds how long *sent* data may stay
+    unacknowledged (Linux TCP_USER_TIMEOUT) — otherwise the kernel retransmits
+    for many minutes before giving up. Options the platform lacks are skipped.
+    """
+    if sock is None:
+        return
+    idle = int(CFG.get("tcp_keepalive_idle_s", 30))
+    interval = int(CFG.get("tcp_keepalive_interval_s", 10))
+    count = int(CFG.get("tcp_keepalive_count", 3))
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # Linux calls the idle time TCP_KEEPIDLE; macOS calls it TCP_KEEPALIVE.
+    idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    if idle_opt is not None:
+        options.append((socket.IPPROTO_TCP, idle_opt, idle))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval))
+    if hasattr(socket, "TCP_KEEPCNT"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count))
+    if user_timeout_s and hasattr(socket, "TCP_USER_TIMEOUT"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(user_timeout_s * 1000)))
+    for level, opt, value in options:
+        try:
+            sock.setsockopt(level, opt, value)
+        except (OSError, AttributeError):
+            pass
+
+
 async def read_exactly(reader, n, timeout=30):
     data = b""
     while len(data) < n:
@@ -111,10 +146,16 @@ async def read_exactly(reader, n, timeout=30):
     return data
 
 
-async def forward_and_tap(src_reader, dst_writer, tap_fn, label=""):
+async def forward_and_tap(src_reader, dst_writer, tap_fn, label="", idle_timeout=None):
+    """Copy src -> dst until EOF or error. If idle_timeout is set, also stop
+    when the source has sent nothing for that many seconds."""
     try:
         while True:
-            data = await src_reader.read(8192)
+            try:
+                data = await asyncio.wait_for(src_reader.read(8192), timeout=idle_timeout or None)
+            except asyncio.TimeoutError:
+                print(f"[forward:{label}] no data for {idle_timeout}s — treating session as dead", flush=True)
+                break
             if not data:
                 break
             if tap_fn:
@@ -163,6 +204,7 @@ async def handle_rdc_connection(rdc_reader, rdc_writer):
         flush=True,
     )
     STATE.rdc_connected = True
+    configure_keepalive(sock)
 
     try:
         stable_threshold = CFG.get("internet_stable_before_proxy_s", 300)
@@ -217,6 +259,10 @@ async def proxy_mode(rdc_reader, rdc_writer, cloud_ip, cloud_port=None):
         return
 
     STATE.cloud_connected = True
+    configure_keepalive(
+        cloud_writer.get_extra_info("socket"),
+        user_timeout_s=CFG.get("cloud_tcp_user_timeout_s", 60),
+    )
 
     try:
         cloud_greeting = await read_exactly(cloud_reader, 576, timeout=30)
@@ -250,7 +296,13 @@ async def proxy_mode(rdc_reader, rdc_writer, cloud_ip, cloud_port=None):
         print("[proxy] handshake complete — forwarding data", flush=True)
 
         rdc_to_cloud = asyncio.create_task(
-            forward_and_tap(rdc_reader, cloud_writer, STATE.ingest_buffer, "rdc->cloud")
+            # The RDC reports every few seconds even in standby, so a long
+            # silence means the session is dead. The cloud side is legitimately
+            # quiet, so it gets no idle timeout (keepalive covers it).
+            forward_and_tap(
+                rdc_reader, cloud_writer, STATE.ingest_buffer, "rdc->cloud",
+                idle_timeout=CFG.get("rdc_idle_timeout_s", 120),
+            )
         )
         cloud_to_rdc = asyncio.create_task(
             forward_and_tap(cloud_reader, rdc_writer, None, "cloud->rdc")
@@ -299,8 +351,13 @@ async def local_mode(rdc_reader, rdc_writer):
         print("[proxy] local handshake complete — ingesting telemetry", flush=True)
 
         stable_threshold = CFG.get("internet_stable_before_proxy_s", 300)
+        idle_timeout = CFG.get("rdc_idle_timeout_s", 120) or None
         while True:
-            data = await rdc_reader.read(8192)
+            try:
+                data = await asyncio.wait_for(rdc_reader.read(8192), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                print(f"[proxy] no data from RDC for {idle_timeout}s — ending local session", flush=True)
+                break
             if not data:
                 break
             STATE.ingest_buffer(data)
