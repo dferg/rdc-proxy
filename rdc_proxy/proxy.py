@@ -147,6 +147,16 @@ async def read_exactly(reader, n, timeout=30):
     return data
 
 
+def _timeout_reason(exc, idle_timeout):
+    """Say which timeout fired. On Python 3.11+ asyncio.TimeoutError is the
+    builtin TimeoutError, which is also what a socket raises when keepalive or
+    TCP_USER_TIMEOUT gives up on the peer (errno ETIMEDOUT) — a different event
+    from our own idle timer expiring, which carries no errno."""
+    if getattr(exc, "errno", None):
+        return "connection timed out (peer stopped responding)"
+    return f"no data for {idle_timeout}s"
+
+
 async def forward_and_tap(src_reader, dst_writer, tap_fn, label="", idle_timeout=None):
     """Copy src -> dst until EOF or error. If idle_timeout is set, also stop
     when the source has sent nothing for that many seconds."""
@@ -154,8 +164,8 @@ async def forward_and_tap(src_reader, dst_writer, tap_fn, label="", idle_timeout
         while True:
             try:
                 data = await asyncio.wait_for(src_reader.read(8192), timeout=idle_timeout or None)
-            except asyncio.TimeoutError:
-                print(f"[forward:{label}] no data for {idle_timeout}s — treating session as dead", flush=True)
+            except asyncio.TimeoutError as e:
+                print(f"[forward:{label}] {_timeout_reason(e, idle_timeout)} — treating session as dead", flush=True)
                 break
             if not data:
                 break
@@ -365,8 +375,8 @@ async def local_mode(rdc_reader, rdc_writer):
         while True:
             try:
                 data = await asyncio.wait_for(rdc_reader.read(8192), timeout=idle_timeout)
-            except asyncio.TimeoutError:
-                print(f"[proxy] no data from RDC for {idle_timeout}s — ending local session", flush=True)
+            except asyncio.TimeoutError as e:
+                print(f"[proxy] RDC: {_timeout_reason(e, idle_timeout)} — ending local session", flush=True)
                 break
             if not data:
                 break

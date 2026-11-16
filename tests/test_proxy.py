@@ -286,3 +286,19 @@ async def test_redirected_connection_resolves_cloud_instead_of_dialing_itself(mo
         state_mod.STATE.internet_stable_since = None
 
     assert calls == [("20.42.6.10", None)]
+
+
+@pytest.mark.asyncio
+async def test_forward_and_tap_reports_socket_timeout_distinctly(capsys):
+    """A keepalive / TCP_USER_TIMEOUT failure surfaces as TimeoutError with an
+    errno; it must end the session and not be reported as our idle timer."""
+    import errno
+
+    class TimedOutReader:
+        async def read(self, _n):
+            raise TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+
+    await proxy_mod.forward_and_tap(TimedOutReader(), FakeWriter(), None, label="t")
+    out = capsys.readouterr().out
+    assert "connection timed out" in out
+    assert "None" not in out
