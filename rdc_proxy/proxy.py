@@ -8,6 +8,7 @@ Three modes (decided per RDC connection):
 
 import asyncio
 import socket
+import struct
 import time
 
 from rdc_proxy.config import CFG
@@ -68,6 +69,34 @@ async def internet_monitor():
 
 
 # ── TCP proxy primitives ───────────────────────────────────────────────────
+
+def abort_connection(writer):
+    """Close our side of a connection with a TCP RST instead of a FIN.
+
+    The RDC does not reliably reconnect after a graceful close (FIN): it can
+    sit half-open indefinitely. A reset makes it notice at once and dial
+    again. SO_LINGER with a zero timeout turns the close into a reset;
+    transport.abort() then closes without waiting to flush.
+    """
+    if writer is None:
+        return
+    try:
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+            )
+    except (OSError, AttributeError):
+        pass  # already closed, or not a real socket
+    transport = getattr(writer, "transport", None)
+    try:
+        if transport is not None:
+            transport.abort()
+        else:
+            writer.close()
+    except Exception:
+        pass
+
 
 async def read_exactly(reader, n, timeout=30):
     data = b""
@@ -162,10 +191,13 @@ async def handle_rdc_connection(rdc_reader, rdc_writer):
                 await proxy_mode(rdc_reader, rdc_writer, cloud_ip)
             else:
                 print("[proxy] cloud unreachable despite internet — closing", flush=True)
-                rdc_writer.close()
     finally:
         STATE.rdc_connected = False
         STATE.cloud_connected = False
+        if CFG.get("rdc_reset_on_close", True):
+            abort_connection(rdc_writer)
+        else:
+            rdc_writer.close()
         print("[proxy] RDC connection ended", flush=True)
 
 

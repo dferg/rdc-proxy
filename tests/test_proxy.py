@@ -133,3 +133,45 @@ async def test_start_server_uses_configured_listen_address():
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_abort_connection_sends_reset_not_eof():
+    """The peer must see a reset (ConnectionResetError), not a clean EOF."""
+    async def handler(_reader, writer):
+        proxy_mod.abort_connection(writer)
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        with pytest.raises(ConnectionResetError):
+            await asyncio.wait_for(reader.read(1), timeout=5)
+        writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_abort_connection_falls_back_to_close_without_transport():
+    w = FakeWriter()
+    proxy_mod.abort_connection(w)
+    assert w.closed is True
+    proxy_mod.abort_connection(None)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_handle_rdc_connection_closes_rdc_side_when_session_ends(reset_handshake):
+    """Whatever path the session takes, the RDC-side writer is torn down."""
+    HANDSHAKE["cloud_greeting"] = b"G" * 576
+    HANDSHAKE["rdc_response"] = b"R" * 576
+    HANDSHAKE["config_msg"] = b"C" * 36
+    state_mod.STATE.internet_up = False
+    state_mod.STATE.internet_stable_since = None
+
+    rdc_writer = FakeWriter()
+    await proxy_mod.handle_rdc_connection(FakeReader(b"R" * 576), rdc_writer)
+
+    assert rdc_writer.closed is True
+    assert state_mod.STATE.rdc_connected is False

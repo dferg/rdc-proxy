@@ -80,6 +80,9 @@ DEFAULT_CONFIG = {
     "cloud_port": 5253,
     "internet_check_interval_s": 30,
     "internet_stable_before_proxy_s": 300,
+    # End the RDC's session with a TCP RST rather than a FIN. The RDC does not
+    # reliably reconnect after a graceful close.
+    "rdc_reset_on_close": True,
     "oil_check_runtime_hours": 24,
     "stale_seconds": 45,
     "stale_thresholds": STALE_THRESHOLDS_DEFAULTS,
