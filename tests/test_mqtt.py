@@ -320,3 +320,16 @@ def test_oil_check_entities_follow_runtime(fresh_state, isolated_cfg):
     publisher._publish_derived_states()
     assert _topic_payloads(fake, "rdc_proxy/oil_check_warn") == ["ON"]
     assert _topic_payloads(fake, "rdc_proxy/oil_runtime_since_check") == ["30.5"]
+
+
+def test_utility_power_is_unknown_until_a_voltage_reading_arrives(fresh_state, isolated_cfg):
+    """No reading yet must not be reported as an outage."""
+    publisher, fake = _started_publisher(fresh_state)
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/utility_power") == ["None"]
+
+    fresh_state.update("utilityVoltageV", 241.0)
+    publisher._publish_derived_states()
+    fresh_state.update("utilityVoltageV", 0.0)
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/utility_power") == ["None", "ON", "OFF"]

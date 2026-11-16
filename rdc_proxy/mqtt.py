@@ -81,9 +81,15 @@ UPFRONT_FIELDS = [
 # automations don't hold the last running value forever.
 ZERO_ON_STANDBY = {
     "engineSpeedRpm": "0",
+    "engineSpeedRpm_2": "0",
     "generatorVoltageV": "0.0",
+    "generatorVoltageV_2": "0.0",
+    "generatorVoltageV_3": "0.0",
+    "generatorVoltageV_4": "0.0",
     "engineFrequencyHz": "0.0",
+    "engineFrequencyHz_2": "0.0",
     "generatorLoadW": "0.0",
+    "generatorLoadW_2": "0.0",
     "generatorLoadPercent": "0",
     "generatorCurrentA": "0.0",
 }
@@ -392,12 +398,20 @@ class MqttPublisher:
     def _derived_states(self):
         """Current value of every derived entity, as MQTT payload strings."""
         mode = self.state.get_display_mode()
-        util_v = self.state.values.get("utilityVoltageV", 0) or 0
+        # Some controllers report utility voltage only now and then. Until a
+        # reading has arrived we do not know whether utility power is present,
+        # and claiming OFF would look like an outage after every restart.
+        # "None" is the payload Home Assistant reads as "unknown".
+        util_v = self.state.values.get("utilityVoltageV")
+        if util_v is None:
+            utility_power = "None"
+        else:
+            utility_power = "ON" if util_v > 50 else "OFF"
         oil_warn, oil_runtime = self.state.oil_check_status()
         return {
             "mode": mode,
             "running": "ON" if mode in ("exercise", "running") else "OFF",
-            "utility_power": "ON" if util_v > 50 else "OFF",
+            "utility_power": utility_power,
             "proxy_mode": str(self.state.proxy_mode),
             "oil_check_warn": "ON" if oil_warn else "OFF",
             "oil_runtime_since_check": str(round(oil_runtime, 2)),
