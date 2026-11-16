@@ -15,6 +15,10 @@ from datetime import datetime
 from rdc_proxy.config import CFG
 from rdc_proxy.wire import parse_tlv_records
 
+# Engine speed is reported every ~5 s while the engine turns; three missed
+# reports means it has stopped.
+RPM_STALE_S = 15
+
 
 class GeneratorState:
     """Thread-safe container for decoded telemetry, proxy state, and side channels."""
@@ -106,8 +110,10 @@ class GeneratorState:
             return {k: dict(v) for k, v in self._side_channels.items()}
 
     def _display_mode(self):
+        # The RDC stops reporting RPM when the engine stops rather than
+        # sending a zero, so a reading older than RPM_STALE_S means "stopped".
         rpm_ts = self.value_timestamps.get("engineSpeedRpm")
-        if rpm_ts and (time.time() - rpm_ts <= 15):
+        if rpm_ts and (time.time() - rpm_ts <= RPM_STALE_S):
             rpm = self.values.get("engineSpeedRpm", 0) or 0
         else:
             rpm = 0
@@ -117,6 +123,16 @@ class GeneratorState:
         if rpm > 100:
             return "exercise"
         return "standby"
+
+    def _oil_check_status(self):
+        """(warn, runtime hours since the last oil check). Caller holds the lock."""
+        runtime = self.values.get("totalRuntimeHours", 0) or 0
+        since_check = runtime - self.oil_check_runtime_start
+        return since_check >= CFG.get("oil_check_runtime_hours", 24), since_check
+
+    def oil_check_status(self):
+        with self.lock:
+            return self._oil_check_status()
 
     def get_display_mode(self):
         with self.lock:
@@ -179,9 +195,7 @@ class GeneratorState:
             # Oil-check logic reads from the *last-seen* runtime (not the
             # pruned snapshot) so a stale hours reading doesn't accidentally
             # reset the oil-check warning state.
-            runtime = self.values.get("totalRuntimeHours", 0) or 0
-            oil_runtime_since_check = runtime - self.oil_check_runtime_start
-            oil_warn = oil_runtime_since_check >= CFG.get("oil_check_runtime_hours", 24)
+            oil_warn, oil_runtime_since_check = self._oil_check_status()
 
             stable_threshold_s = CFG.get("internet_stable_before_proxy_s", 300)
             seconds_to_stable = None

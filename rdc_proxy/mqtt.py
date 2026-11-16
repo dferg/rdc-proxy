@@ -1,4 +1,15 @@
-"""MQTT publishing for Home Assistant ingestion with upfront discovery and mode sensors."""
+"""MQTT publishing for Home Assistant ingestion.
+
+Two kinds of entity are published:
+
+- one sensor per decoded telemetry field (state topic <base>/<field>), and
+- a few *derived* entities computed from GeneratorState rather than read off
+  the wire (generator mode, running, utility power, proxy mode, oil check).
+
+Discovery for the common fields and all derived entities is sent as soon as
+the device id is known, so Home Assistant shows a complete device straight
+away instead of growing entities as fields happen to arrive.
+"""
 
 from datetime import datetime, timedelta
 import json
@@ -45,6 +56,9 @@ FIELD_META = {
     "utilityVoltageV_B": {"device_class": "voltage", "state_class": "measurement"},
 }
 
+# Fields announced to Home Assistant up front, before their first value. Many
+# are only reported while the engine runs, so otherwise they would not exist
+# as entities until the first exercise or outage.
 UPFRONT_FIELDS = [
     "batteryVoltageV",
     "utilityVoltageV",
@@ -62,6 +76,23 @@ UPFRONT_FIELDS = [
     "maintHoursSinceLast",
 ]
 
+# The RDC stops reporting these when the engine stops rather than sending a
+# final zero. Publish the zero ourselves on entering standby so graphs and
+# automations don't hold the last running value forever.
+ZERO_ON_STANDBY = {
+    "engineSpeedRpm": "0",
+    "generatorVoltageV": "0.0",
+    "engineFrequencyHz": "0.0",
+    "generatorLoadW": "0.0",
+    "generatorLoadPercent": "0",
+    "generatorCurrentA": "0.0",
+}
+
+# How often to re-evaluate derived entities when no telemetry is arriving
+# (mode falls back to standby on RPM staleness, proxy mode changes on its own).
+DERIVED_REFRESH_S = 5
+
+# Entities computed from GeneratorState, keyed by state-topic suffix.
 CUSTOM_ENTITIES = {
     "mode": {
         "component": "sensor",
@@ -132,6 +163,9 @@ def _topic(*parts):
 
 
 def _timestamp_payload(value):
+    # RDC timestamp values are .NET ticks holding the controller's local wall
+    # clock time. Attach the host's local timezone so Home Assistant does not
+    # interpret the wall-clock value as UTC.
     ts = datetime(1, 1, 1) + timedelta(microseconds=int(value) / 10)
     return ts.astimezone().isoformat()
 
@@ -161,9 +195,11 @@ class MqttPublisher:
         self._model_code = None
         self._availability_online = False
         self.state = None
-        self._last_mode = None
-        self._stop_watchdog = threading.Event()
-        self._watchdog_thread = None
+        # Derived entities are published from both the telemetry thread and
+        # the refresh thread; only values that changed are sent.
+        self._derived_lock = threading.Lock()
+        self._last_derived = {}
+        self._refresh_thread = None
 
     def _make_client(self, client_factory):
         if client_factory:
@@ -201,21 +237,20 @@ class MqttPublisher:
             f"[mqtt] publishing to {self.cfg['host']}:{int(self.cfg.get('port', 1883))}",
             flush=True,
         )
-        self._start_watchdog()
+        self._start_derived_refresh()
 
-    def _start_watchdog(self):
-        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
-            self._stop_watchdog.clear()
-            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
-            self._watchdog_thread.start()
+    def _start_derived_refresh(self):
+        if self._refresh_thread is None or not self._refresh_thread.is_alive():
+            self._refresh_thread = threading.Thread(target=self._derived_refresh_loop, daemon=True)
+            self._refresh_thread.start()
 
-    def _watchdog_loop(self):
-        while not self._stop_watchdog.wait(5):
+    def _derived_refresh_loop(self):
+        while True:
+            time.sleep(DERIVED_REFRESH_S)
             try:
-                if self._device_id() is not None:
-                    self._publish_derived_states()
+                self._publish_derived_states()
             except Exception as e:
-                print(f"[mqtt] watchdog error: {e}", flush=True)
+                print(f"[mqtt] derived-state refresh failed: {e}", flush=True)
 
     def _on_connect(self, client, _userdata, _flags, reason_code, _properties=None):
         if reason_code == 0 or str(reason_code) == "Success":
@@ -295,62 +330,21 @@ class MqttPublisher:
         for custom_field in CUSTOM_ENTITIES:
             self._publish_custom_discovery(custom_field)
 
-    def _publish_discovery(self, field, force=False):
-        if field in CUSTOM_ENTITIES:
-            self._publish_custom_discovery(field, force=force)
-            return
-
-        device_id = self._device_id()
-        if device_id is None:
-            self._pending_discovery.add(field)
-            return
-        if field in self._discovered and not force:
-            return
-        self._discovered.add(field)
-
-        object_id = f"generator_{device_id}_{_field_slug(field)}"
-        payload = {
-            "name": _friendly_name(field),
-            "unique_id": object_id,
-            "state_topic": _topic(self.base_topic, field),
-            "availability_topic": _topic(self.base_topic, "status"),
-            "device": {
-                "identifiers": [self._device_identifier()],
-                "name": self.device_name,
-                "manufacturer": "Kohler",
-            },
-        }
-        if self._serial_number:
-            payload["device"]["serial_number"] = self._serial_number
-        if self._model_code:
-            payload["device"]["model"] = self._model_code
-        unit = FIELD_UNITS.get(field)
-        if unit:
-            payload["unit_of_measurement"] = HA_UNITS.get(unit, unit)
-        payload.update(FIELD_META.get(field, {}))
-
-        self.client.publish(
-            _topic(self.discovery_prefix, "sensor", device_id, field, "config"),
-            json.dumps(payload, sort_keys=True),
-            qos=self.qos,
-            retain=True,
-        )
-
-    def _publish_custom_discovery(self, key, force=False):
-        device_id = self._device_id()
-        if device_id is None:
+    def _should_announce(self, key, force):
+        """Shared gate for discovery: needs a device id, and happens once per
+        entity unless forced (device metadata changed)."""
+        if self._device_id() is None:
             self._pending_discovery.add(key)
-            return
+            return False
         if key in self._discovered and not force:
-            return
+            return False
         self._discovered.add(key)
+        return True
 
-        info = CUSTOM_ENTITIES.get(key, {})
-        component = info.get("component", "sensor")
-        object_id = f"generator_{device_id}_{_field_slug(key)}"
+    def _discovery_payload(self, key, name):
         payload = {
-            "name": info.get("name", _friendly_name(key)),
-            "unique_id": object_id,
+            "name": name,
+            "unique_id": f"generator_{self._device_id()}_{_field_slug(key)}",
             "state_topic": _topic(self.base_topic, key),
             "availability_topic": _topic(self.base_topic, "status"),
             "device": {
@@ -363,71 +357,74 @@ class MqttPublisher:
             payload["device"]["serial_number"] = self._serial_number
         if self._model_code:
             payload["device"]["model"] = self._model_code
-        for k in ("device_class", "icon", "entity_category", "payload_on", "payload_off", "unit_of_measurement"):
-            if k in info:
-                payload[k] = info[k]
+        return payload
 
+    def _publish_discovery_config(self, component, key, payload):
         self.client.publish(
-            _topic(self.discovery_prefix, component, device_id, key, "config"),
+            _topic(self.discovery_prefix, component, self._device_id(), key, "config"),
             json.dumps(payload, sort_keys=True),
             qos=self.qos,
             retain=True,
         )
 
-    def _publish_derived_states(self, force=False):
-        if not self.state:
+    def _publish_discovery(self, field, force=False):
+        if field in CUSTOM_ENTITIES:
+            self._publish_custom_discovery(field, force=force)
             return
+        if not self._should_announce(field, force):
+            return
+        payload = self._discovery_payload(field, _friendly_name(field))
+        unit = FIELD_UNITS.get(field)
+        if unit:
+            payload["unit_of_measurement"] = HA_UNITS.get(unit, unit)
+        payload.update(FIELD_META.get(field, {}))
+        self._publish_discovery_config("sensor", field, payload)
 
-        now = time.time()
-        rpm_ts = self.state.value_timestamps.get("engineSpeedRpm")
-        if rpm_ts and (now - rpm_ts <= 15):
-            rpm = self.state.values.get("engineSpeedRpm", 0) or 0
-        else:
-            rpm = 0
+    def _publish_custom_discovery(self, key, force=False):
+        if not self._should_announce(key, force):
+            return
+        info = dict(CUSTOM_ENTITIES[key])
+        component = info.pop("component", "sensor")
+        payload = self._discovery_payload(key, info.pop("name", _friendly_name(key)))
+        payload.update(info)
+        self._publish_discovery_config(component, key, payload)
 
+    def _derived_states(self):
+        """Current value of every derived entity, as MQTT payload strings."""
+        mode = self.state.get_display_mode()
         util_v = self.state.values.get("utilityVoltageV", 0) or 0
+        oil_warn, oil_runtime = self.state.oil_check_status()
+        return {
+            "mode": mode,
+            "running": "ON" if mode in ("exercise", "running") else "OFF",
+            "utility_power": "ON" if util_v > 50 else "OFF",
+            "proxy_mode": str(self.state.proxy_mode),
+            "oil_check_warn": "ON" if oil_warn else "OFF",
+            "oil_runtime_since_check": str(round(oil_runtime, 2)),
+        }
 
-        if rpm > 100 and util_v < 10:
-            mode = "running"
-        elif rpm > 100:
-            mode = "exercise"
-        else:
-            mode = "standby"
-
-        running = "ON" if mode in ("exercise", "running") else "OFF"
-        utility_power = "ON" if util_v > 50 else "OFF"
-        proxy_mode = getattr(self.state, "proxy_mode", "unknown")
-
-        mode_changed = mode != self._last_mode
-        self._last_mode = mode
-
-        # If entering standby or first initialization, set engine parameters to 0
-        if mode == "standby" and (mode_changed or force):
-            if "engineSpeedRpm" not in self.state.values or rpm == 0:
-                self.client.publish(_topic(self.base_topic, "engineSpeedRpm"), "0", qos=self.qos, retain=self.retain)
-            if "generatorVoltageV" not in self.state.values or rpm == 0:
-                self.client.publish(_topic(self.base_topic, "generatorVoltageV"), "0.0", qos=self.qos, retain=self.retain)
-            if "engineFrequencyHz" not in self.state.values or rpm == 0:
-                self.client.publish(_topic(self.base_topic, "engineFrequencyHz"), "0.0", qos=self.qos, retain=self.retain)
-            self.client.publish(_topic(self.base_topic, "generatorLoadW"), "0.0", qos=self.qos, retain=self.retain)
-            self.client.publish(_topic(self.base_topic, "generatorLoadPercent"), "0", qos=self.qos, retain=self.retain)
-            self.client.publish(_topic(self.base_topic, "generatorCurrentA"), "0.0", qos=self.qos, retain=self.retain)
-
-        self.client.publish(_topic(self.base_topic, "mode"), mode, qos=self.qos, retain=self.retain)
-        self.client.publish(_topic(self.base_topic, "running"), running, qos=self.qos, retain=self.retain)
-        self.client.publish(_topic(self.base_topic, "utility_power"), utility_power, qos=self.qos, retain=self.retain)
-        self.client.publish(_topic(self.base_topic, "proxy_mode"), proxy_mode, qos=self.qos, retain=self.retain)
-
-        if hasattr(self.state, "oil_check_warn"):
-            oil_warn = "ON" if getattr(self.state, "oil_check_warn", False) else "OFF"
-            self.client.publish(_topic(self.base_topic, "oil_check_warn"), oil_warn, qos=self.qos, retain=self.retain)
-        if hasattr(self.state, "oil_runtime_since_check"):
-            self.client.publish(
-                _topic(self.base_topic, "oil_runtime_since_check"),
-                str(getattr(self.state, "oil_runtime_since_check", 0)),
-                qos=self.qos,
-                retain=self.retain,
+    def _publish_derived_states(self, force=False):
+        """Publish derived entities whose value changed (all of them when
+        forced, e.g. after a broker reconnect). Needs the device id, because
+        the entities don't exist in Home Assistant before discovery."""
+        if self.state is None or self._device_id() is None:
+            return
+        current = self._derived_states()
+        with self._derived_lock:
+            previous = self._last_derived
+            changed = {
+                key: value for key, value in current.items()
+                if force or previous.get(key) != value
+            }
+            entered_standby = current["mode"] == "standby" and (
+                force or previous.get("mode") != "standby"
             )
+            self._last_derived = current
+        if entered_standby:
+            for field, zero in ZERO_ON_STANDBY.items():
+                self.client.publish(_topic(self.base_topic, field), zero, qos=self.qos, retain=self.retain)
+        for key, value in changed.items():
+            self.client.publish(_topic(self.base_topic, key), value, qos=self.qos, retain=self.retain)
 
 
 def start_mqtt_publisher(cfg, state):

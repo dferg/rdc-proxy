@@ -248,3 +248,15 @@ def test_generator_load_fields_visible_in_running(fresh_state, isolated_cfg):
     assert snap["values"]["generatorCurrentA"] == 35.4
     assert snap["visibility"].get("generatorLoadW", True) is not False
 
+
+
+def test_display_mode_falls_back_to_standby_when_rpm_goes_stale(fresh_state, isolated_cfg):
+    """The RDC stops sending RPM when the engine stops; it never sends 0."""
+    import time
+
+    fresh_state.update("utilityVoltageV", 240.0)
+    fresh_state.update("engineSpeedRpm", 3600)
+    assert fresh_state.get_display_mode() == "exercise"
+
+    fresh_state.value_timestamps["engineSpeedRpm"] = time.time() - 60
+    assert fresh_state.get_display_mode() == "standby"

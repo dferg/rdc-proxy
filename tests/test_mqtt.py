@@ -226,3 +226,97 @@ def test_first_update_publishes_online_if_connect_callback_did_not():
         if item == ("rdc_proxy/status", "online", 0, True)
     ]
     assert len(online_publishes) == 1
+
+
+# ── Derived entities (mode, running, utility power, proxy mode, oil check) ──
+
+def _started_publisher(state):
+    fake = FakeMqttClient()
+    publisher = MqttPublisher(_cfg(device_id="gen1"), lambda: fake)
+    publisher.state = state  # no start(): keeps the refresh thread out of tests
+    return publisher, fake
+
+
+def _topic_payloads(fake, topic):
+    return [payload for t, payload, _qos, _retain in fake.published if t == topic]
+
+
+def test_derived_entities_are_discovered_with_their_component(fresh_state, isolated_cfg):
+    publisher, fake = _started_publisher(fresh_state)
+    publisher._publish_all_discoveries()
+
+    running = json.loads(_topic_payloads(fake, "homeassistant/binary_sensor/gen1/running/config")[0])
+    assert running["name"] == "Generator Running"
+    assert running["device_class"] == "running"
+    assert running["payload_on"] == "ON"
+    assert running["state_topic"] == "rdc_proxy/running"
+    assert "component" not in running
+
+    mode = json.loads(_topic_payloads(fake, "homeassistant/sensor/gen1/mode/config")[0])
+    assert mode["unique_id"] == "generator_gen1_mode"
+    # Engine-gated fields exist as entities before their first value.
+    assert _topic_payloads(fake, "homeassistant/sensor/gen1/generatorLoadW/config")
+
+
+def test_derived_states_publish_only_on_change(fresh_state, isolated_cfg):
+    publisher, fake = _started_publisher(fresh_state)
+    fresh_state.update("utilityVoltageV", 240.0)
+
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/mode") == ["standby"]
+    assert _topic_payloads(fake, "rdc_proxy/running") == ["OFF"]
+    assert _topic_payloads(fake, "rdc_proxy/utility_power") == ["ON"]
+    assert _topic_payloads(fake, "rdc_proxy/proxy_mode") == ["startup"]
+    assert _topic_payloads(fake, "rdc_proxy/oil_check_warn") == ["OFF"]
+
+    count = len(fake.published)
+    publisher._publish_derived_states()
+    publisher._publish_derived_states()
+    assert len(fake.published) == count  # nothing changed, nothing sent
+
+    fresh_state.set_proxy_mode("proxy")
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/proxy_mode") == ["startup", "proxy"]
+    assert len(fake.published) == count + 1
+
+    publisher._publish_derived_states(force=True)  # e.g. broker reconnect
+    assert _topic_payloads(fake, "rdc_proxy/mode") == ["standby", "standby"]
+
+
+def test_outage_then_restore_updates_running_and_zeroes_engine_fields(fresh_state, isolated_cfg):
+    import time
+
+    publisher, fake = _started_publisher(fresh_state)
+    fresh_state.update("utilityVoltageV", 0.0)
+    fresh_state.update("engineSpeedRpm", 3600)
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/mode") == ["running"]
+    assert _topic_payloads(fake, "rdc_proxy/running") == ["ON"]
+    assert _topic_payloads(fake, "rdc_proxy/utility_power") == ["OFF"]
+    assert _topic_payloads(fake, "rdc_proxy/engineSpeedRpm") == []  # no zeroing while running
+
+    # Utility returns and the RDC simply stops reporting RPM.
+    fresh_state.update("utilityVoltageV", 240.0)
+    fresh_state.value_timestamps["engineSpeedRpm"] = time.time() - 60
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/mode") == ["running", "standby"]
+    assert _topic_payloads(fake, "rdc_proxy/running") == ["ON", "OFF"]
+    assert _topic_payloads(fake, "rdc_proxy/engineSpeedRpm") == ["0"]
+    assert _topic_payloads(fake, "rdc_proxy/generatorLoadW") == ["0.0"]
+
+
+def test_derived_states_wait_for_device_id(fresh_state, isolated_cfg):
+    fake = FakeMqttClient()
+    publisher = MqttPublisher(_cfg(), lambda: fake)  # no device_id, no serial yet
+    publisher.state = fresh_state
+    publisher._publish_derived_states()
+    assert fake.published == []
+
+
+def test_oil_check_entities_follow_runtime(fresh_state, isolated_cfg):
+    publisher, fake = _started_publisher(fresh_state)
+    isolated_cfg["oil_check_runtime_hours"] = 24
+    fresh_state.update("totalRuntimeHours", 30.5)
+    publisher._publish_derived_states()
+    assert _topic_payloads(fake, "rdc_proxy/oil_check_warn") == ["ON"]
+    assert _topic_payloads(fake, "rdc_proxy/oil_runtime_since_check") == ["30.5"]
