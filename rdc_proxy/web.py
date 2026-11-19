@@ -41,6 +41,12 @@ def api_status():
     return jsonify(snap)
 
 
+@app.route("/api/raw-params")
+def api_raw_params():
+    """Every parameter id the RDC has sent since startup, named or not."""
+    return jsonify(STATE.raw_params())
+
+
 @app.route("/api/reset-oil-check", methods=["POST"])
 def reset_oil():
     STATE.reset_oil_check()

@@ -69,8 +69,9 @@ def decode_value(raw_bytes, vlen, transform):
     return raw
 
 
-def parse_tlv_records(buf):
-    """Yield (param_id, decoded_name, decoded_value, units) from a TLV buffer.
+def parse_tlv_raw(buf):
+    """Yield (param_id, vlen, value_bytes) for every record in a TLV buffer,
+    whether or not the parameter is in PARAM_MAP.
 
     Format (little-endian throughout):
       Header 12B: [len:u32][ver=2:u16][record_count:u16][rsvd:u32]
@@ -103,11 +104,26 @@ def parse_tlv_records(buf):
         if not ok or off != len(body):
             i += 1
             continue
-        for rid, vlen, val in recs:
-            meta = PARAM_MAP.get(rid)
-            if meta:
-                name, transform, units = meta
-                decoded = decode_value(val, vlen, transform)
-                if decoded is not None:
-                    yield rid, name, decoded, units
+        yield from recs
         i += lf
+
+
+def decode_record(rid, vlen, val):
+    """(name, decoded_value, units) for a known parameter, else None."""
+    meta = PARAM_MAP.get(rid)
+    if not meta:
+        return None
+    name, transform, units = meta
+    decoded = decode_value(val, vlen, transform)
+    if decoded is None:
+        return None
+    return name, decoded, units
+
+
+def parse_tlv_records(buf):
+    """Yield (param_id, decoded_name, decoded_value, units) for the records in
+    a TLV buffer whose parameter is in PARAM_MAP."""
+    for rid, vlen, val in parse_tlv_raw(buf):
+        rec = decode_record(rid, vlen, val)
+        if rec:
+            yield (rid, *rec)

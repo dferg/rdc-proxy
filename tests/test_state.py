@@ -260,3 +260,29 @@ def test_display_mode_falls_back_to_standby_when_rpm_goes_stale(fresh_state, iso
 
     fresh_state.value_timestamps["engineSpeedRpm"] = time.time() - 60
     assert fresh_state.get_display_mode() == "standby"
+
+
+def test_raw_params_records_unknown_ids(fresh_state):
+    from tests.test_wire import _build_frame, _build_record
+    for v in (5, 9, 9, 2):
+        fresh_state.ingest_buffer(_build_frame([
+            _build_record(0xBEEF, struct.pack("<i", v)),
+            _build_record(0x044C, struct.pack("<i", 3600)),
+        ]))
+    raw = fresh_state.raw_params()
+    unknown = raw["0xBEEF"]
+    assert unknown["name"] is None
+    assert (unknown["value"], unknown["min"], unknown["max"]) == (2, 2, 9)
+    assert (unknown["count"], unknown["changes"], unknown["vlen"]) == (4, 2, 4)
+    assert unknown["hex"] == "02000000"
+    assert raw["0x044C"]["name"] == "engineSpeedRpm"
+    # Unknown ids never leak into the decoded values.
+    assert set(fresh_state.values) == {"engineSpeedRpm"}
+
+
+def test_raw_params_table_is_bounded(fresh_state, monkeypatch):
+    from tests.test_wire import _build_frame, _build_record
+    monkeypatch.setattr(state_mod, "RAW_PARAMS_MAX", 3)
+    for rid in range(0x7000, 0x7010):
+        fresh_state.ingest_buffer(_build_frame([_build_record(rid, struct.pack("<i", 1))]))
+    assert len(fresh_state.raw_params()) == 3

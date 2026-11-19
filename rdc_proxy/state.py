@@ -7,17 +7,23 @@ dependency graph (config -> wire -> state -> {proxy, dashboard}).
 
 import json
 import os
+import struct
 import threading
 import time
 from collections import deque
 from datetime import datetime
 
 from rdc_proxy.config import CFG
-from rdc_proxy.wire import parse_tlv_records
+from rdc_proxy.wire import PARAM_MAP, decode_record, parse_tlv_raw
 
 # Engine speed is reported every ~5 s while the engine turns; three missed
 # reports means it has stopped.
 RPM_STALE_S = 15
+
+# Bounds on the raw-parameter table (param ids are 16-bit, so 65536 at most;
+# the cap keeps a misparsed stream from growing it without limit).
+RAW_PARAMS_MAX = 2048
+RAW_VALUE_MAX_BYTES = 64
 
 
 class GeneratorState:
@@ -47,6 +53,7 @@ class GeneratorState:
         self.oil_check_warned = False
         self._events = deque(maxlen=50)
         self._side_channels = {}
+        self._raw_params = {}
         self._update_listeners = []
 
     def add_update_listener(self, fn):
@@ -98,8 +105,49 @@ class GeneratorState:
                 print(f"[state] update listener failed: {e}", flush=True)
 
     def ingest_buffer(self, buf):
-        for rid, name, value, units in parse_tlv_records(buf):
-            self.update(name, value)
+        for rid, vlen, val in parse_tlv_raw(buf):
+            self._record_raw(rid, vlen, val)
+            rec = decode_record(rid, vlen, val)
+            if rec:
+                self.update(rec[0], rec[1])
+
+    def _record_raw(self, rid, vlen, val):
+        """Remember the latest raw value of every parameter the RDC sends,
+        including ones PARAM_MAP has no name for, so new parameters can be
+        identified from /api/raw-params without a packet capture."""
+        if vlen == 4:
+            num = struct.unpack("<i", val)[0]
+        elif vlen == 8:
+            num = struct.unpack("<q", val)[0]
+        else:
+            num = None
+        now = time.time()
+        with self.lock:
+            e = self._raw_params.get(rid)
+            if e is None:
+                if len(self._raw_params) >= RAW_PARAMS_MAX:
+                    return
+                e = self._raw_params[rid] = {
+                    "first_seen": now, "count": 0, "changes": 0,
+                    "min": num, "max": num, "hex": None,
+                }
+            hexval = val[:RAW_VALUE_MAX_BYTES].hex()
+            if e["hex"] is not None and e["hex"] != hexval:
+                e["changes"] += 1
+            e.update(last_seen=now, vlen=vlen, value=num, hex=hexval)
+            e["count"] += 1
+            if num is not None:
+                e["min"] = num if e["min"] is None else min(e["min"], num)
+                e["max"] = num if e["max"] is None else max(e["max"], num)
+
+    def raw_params(self):
+        """{"0x052D": {name, value, hex, vlen, count, changes, min, max,
+        first_seen, last_seen}} for every parameter seen since startup."""
+        with self.lock:
+            return {
+                f"0x{rid:04X}": {"name": PARAM_MAP[rid][0] if rid in PARAM_MAP else None, **e}
+                for rid, e in sorted(self._raw_params.items())
+            }
 
     def update_side_channel(self, name, data):
         with self.lock:

@@ -2,7 +2,7 @@
 
 import struct
 
-from rdc_proxy.wire import PARAM_MAP, decode_value, parse_tlv_records
+from rdc_proxy.wire import PARAM_MAP, decode_value, parse_tlv_raw, parse_tlv_records
 
 
 def _build_record(param_id, value_bytes):
@@ -111,3 +111,14 @@ def test_param_map_has_critical_ids():
     # If someone drops these from PARAM_MAP we want to know
     for critical in (0x044C, 0x0453, 0x05F6, 0x09E6, 0x0536):
         assert critical in PARAM_MAP
+
+
+def test_parse_raw_yields_unknown_param_ids():
+    buf = _build_frame([
+        _build_record(0x044C, struct.pack("<i", 3600)),
+        _build_record(0xBEEF, struct.pack("<i", 42)),
+    ])
+    assert list(parse_tlv_raw(buf)) == [
+        (0x044C, 4, struct.pack("<i", 3600)),
+        (0xBEEF, 4, struct.pack("<i", 42)),
+    ]
